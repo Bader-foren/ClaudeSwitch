@@ -58,38 +58,56 @@ namespace ClaudeSwitch
 
     internal sealed class MainWindowController
     {
-        const string Version = "1.0.0";
-
         readonly Engine engine;
         readonly Window w;
-        readonly DispatcherTimer toastTimer;
-        bool busy, loadingSettings;
+        readonly DispatcherTimer toastTimer, pendingTimer, updateTimer;
+        readonly bool afterUpdate;
+        bool busy, loadingSettings, checkingUpdate;
         string lastListKey;
+        string updateStatus = "";
+        UpdateInfo installedUpdate;
         Account menuAccount;
         TaskCompletionSource<string> dialogTcs;
         string dialogPrimaryId;
 
         public Window Window { get { return w; } }
 
-        public MainWindowController()
+        public MainWindowController(bool afterUpdate)
         {
+            this.afterUpdate = afterUpdate;
             engine = new Engine();
             Theme.Apply(engine.Settings.Theme);
             using (Stream s = Assembly.GetExecutingAssembly().GetManifestResourceStream("ClaudeSwitch.MainWindow.xaml"))
                 w = (Window)XamlReader.Load(s);
 
-            toastTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3.5) };
+            toastTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(4) };
             toastTimer.Tick += (s, e) =>
             {
                 toastTimer.Stop();
                 El<Border>("Toast").Visibility = Visibility.Collapsed;
             };
+            // While adding an account, keep the "are you signed in yet?" line current.
+            pendingTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
+            pendingTimer.Tick += (s, e) => { if (!busy && dialogTcs == null) UpdatePendingStatus(); };
+            updateTimer = new DispatcherTimer { Interval = TimeSpan.FromHours(6) };
+            updateTimer.Tick += async (s, e) => await CheckForUpdates(false);
 
-            El<TextBlock>("VersionText").Text = "v" + Version;
-            El<TextBlock>("AboutText").Text = "ClaudeSwitch " + Version + " · free and open source (MIT)\nNot made by or affiliated with Anthropic.";
+            string version = Updater.CurrentText;
+            El<TextBlock>("VersionText").Text = "v" + version;
+            El<TextBlock>("AboutText").Text = "ClaudeSwitch " + version + " · free and open source (MIT)\nNot made by or affiliated with Anthropic.";
             Wire();
             UpdateThemeButton();
             Refresh();
+            w.Loaded += async (s, e) => await OnLoaded();
+        }
+
+        async Task OnLoaded()
+        {
+            if (afterUpdate) Toast("Updated to ClaudeSwitch " + Updater.CurrentText);
+            await RunRepair();
+            await Task.Delay(TimeSpan.FromSeconds(3));
+            await CheckForUpdates(false);
+            updateTimer.Start();
         }
 
         T El<T>(string name) where T : class
@@ -139,6 +157,9 @@ namespace ClaudeSwitch
             Toggle("ManageDesktopToggle", v => engine.Settings.ManageDesktop = v);
             Toggle("ReopenToggle", v => engine.Settings.ReopenDesktop = v);
             Toggle("ManageCodeToggle", v => engine.Settings.ManageCode = v);
+            Toggle("AutoUpdateToggle", v => engine.Settings.AutoUpdate = v);
+            El<Button>("CheckUpdatesBtn").Click += async (s, e) => await CheckForUpdates(true);
+            El<Button>("UpdateRestartBtn").Click += (s, e) => RestartIntoUpdate();
             El<Button>("DesktopFolderBtn").Click += async (s, e) => await PickDesktopFolder();
             El<Button>("DesktopAutoBtn").Click += (s, e) =>
             {
@@ -264,6 +285,12 @@ namespace ClaudeSwitch
             {
                 El<TextBlock>("PendingText").Text = PendingSteps(p);
                 El<Button>("PendingTerminalBtn").Visibility = p.Code ? Visibility.Visible : Visibility.Collapsed;
+                UpdatePendingStatus();
+                if (!pendingTimer.IsEnabled) pendingTimer.Start();
+            }
+            else if (pendingTimer.IsEnabled)
+            {
+                pendingTimer.Stop();
             }
 
             SetStatus("Desktop", "Claude Desktop", engine.Desktop.Found, engine.Settings.ManageDesktop, engine.Desktop.DataDir);
@@ -277,6 +304,46 @@ namespace ClaudeSwitch
             if (p.Code) steps.Add("For Claude Code, click “Claude Code login” (or run claude in a terminal) and sign in.");
             steps.Add("Come back here and click “Save account”.");
             return string.Join("\n", steps.Select((t, i) => (i + 1) + ". " + t));
+        }
+
+        /// <summary>While adding an account, shows whether Claude Desktop is signed in to a new account yet.</summary>
+        void UpdatePendingStatus()
+        {
+            var status = El<TextBlock>("PendingStatus");
+            var p = engine.Settings.Pending;
+            if (p == null || !p.Desktop || !engine.Desktop.Found)
+            {
+                status.Visibility = Visibility.Collapsed;
+                return;
+            }
+            string uuid = engine.Desktop.ReadAccountUuid();
+            bool tokens = engine.Desktop.HasAuthTokens();
+            Account saved = uuid == null ? null : engine.Accounts.FirstOrDefault(a => a.HasDesktop && a.DesktopUuid == uuid);
+            string before = DesktopClient.ReadUuidFrom(System.IO.Path.Combine(p.BackupDir, "desktop"));
+            string text, color;
+            if (uuid == null && !tokens)
+            {
+                text = "Waiting for you to sign in to Claude Desktop…";
+                color = "TextMuted";
+            }
+            else if (saved != null)
+            {
+                text = "Claude Desktop is signed in to “" + saved.Name + "”, which is already saved. Sign in with your other account.";
+                color = "Danger";
+            }
+            else if (uuid != null && uuid == before)
+            {
+                text = "Claude Desktop is still signed in to your previous account. Sign in with your other account.";
+                color = "Danger";
+            }
+            else
+            {
+                text = "✓ Signed in to a new account. Click “Save account”.";
+                color = "Success";
+            }
+            status.Text = text;
+            status.SetResourceReference(TextBlock.ForegroundProperty, color);
+            status.Visibility = Visibility.Visible;
         }
 
         void SetStatus(string prefix, string name, bool found, bool on, string path)
@@ -388,7 +455,13 @@ namespace ClaudeSwitch
             }
 
             bool ok = await RunBusy("Switching to " + a.Name + "…", progress => engine.SwitchTo(a, progress));
-            if (ok) Toast("Now using " + a.Name + (engine.CodeOn && a.HasCode ? ". Restart any open Claude Code sessions." : ""));
+            if (!ok) return;
+            CodeIdentity codeNow = engine.CodeOn ? engine.ReadLive(false).Code : null;
+            if (codeNow != null && codeNow.SignedIn && !a.HasCode)
+                Toast("Now using " + a.Name + ". Claude Code stays on " + (codeNow.Email ?? "its own account")
+                    + ", because no Claude Code sign-in is saved for " + a.Name + ".");
+            else
+                Toast("Now using " + a.Name + (engine.CodeOn && a.HasCode ? ". Restart any open Claude Code sessions." : "."));
         }
 
         async Task AddAccountFlow()
@@ -411,17 +484,36 @@ namespace ClaudeSwitch
             else if (choice == "new") await NewSignInFlow();
         }
 
+        /// <summary>What Claude Desktop and Claude Code are each signed in to right now, one line each.</summary>
         string DescribeLive(LiveState live)
         {
-            var parts = new List<string>();
-            if (engine.DesktopOn && live.DesktopUuid != null) parts.Add("Claude Desktop");
-            if (engine.CodeOn && live.Code.SignedIn) parts.Add(live.Code.Email != null ? "Claude Code (" + live.Code.Email + ")" : "Claude Code");
-            return parts.Count == 0 ? "Nothing looks signed in right now." : "Signed in now: " + string.Join(" and ", parts) + ".";
+            var lines = new List<string>();
+            if (engine.DesktopOn) lines.Add("Claude Desktop: " + DesktopWho(live));
+            if (engine.CodeOn) lines.Add("Claude Code: " + CodeWho(live));
+            return lines.Count == 0 ? "Nothing to save." : string.Join("\n", lines);
+        }
+
+        string DesktopWho(LiveState live)
+        {
+            if (!live.DesktopIn) return "not signed in";
+            Account saved = engine.Accounts.FirstOrDefault(a => a.HasDesktop && a.DesktopUuid == live.DesktopUuid);
+            if (saved != null) return "“" + saved.Name + "” (already saved)";
+            if (live.Code.Uuid == live.DesktopUuid && live.Code.Email != null) return live.Code.Email + " (not saved yet)";
+            return "an account that isn't saved yet";
+        }
+
+        string CodeWho(LiveState live)
+        {
+            if (!live.Code.SignedIn) return "not signed in";
+            string who = live.Code.Email ?? "signed in";
+            if (!live.DesktopIn || live.Code.Uuid == null || live.Code.Uuid == live.DesktopUuid) return who;
+            Account saved = engine.Accounts.FirstOrDefault(a => (a.HasCode && a.CodeUuid == live.Code.Uuid) || (a.HasDesktop && a.DesktopUuid == live.Code.Uuid));
+            return who + (saved != null ? " (“" + saved.Name + "”, a different account)" : " (a different account)");
         }
 
         string SuggestName(LiveState live)
         {
-            if (live.Code.SignedIn && live.Code.Email != null && (live.DesktopUuid == null || live.DesktopUuid == live.Code.Uuid))
+            if (live.Code.SignedIn && live.Code.Email != null && (!live.DesktopIn || live.DesktopUuid == live.Code.Uuid))
                 return live.Code.Email;
             return "Account " + (engine.Accounts.Count + 1);
         }
@@ -442,6 +534,8 @@ namespace ClaudeSwitch
             Account match = existing ?? engine.FindSaved(live);
             bool canDesktop = engine.DesktopOn;
             bool canCode = engine.CodeOn && live.Code.SignedIn;
+            // One saved account holds one Claude account: Claude Code signed in to another account isn't mixed in.
+            bool codeIsOther = canDesktop && live.DesktopIn && canCode && live.Code.Uuid != null && live.Code.Uuid != live.DesktopUuid;
             string suggested = match != null ? match.Name : SuggestName(live);
 
             TextBox nameBox = null;
@@ -452,16 +546,22 @@ namespace ClaudeSwitch
                 nameBox = Input(suggested);
                 body.Children.Add(nameBox);
                 body.Children.Add(FieldLabel("Save the sign-in for"));
-                desktopBox = Tick(engine.Desktop.Found ? "Claude Desktop" : "Claude Desktop (not found)", canDesktop, canDesktop);
+                desktopBox = Tick(!engine.Desktop.Found ? "Claude Desktop (not found)"
+                    : live.DesktopIn ? "Claude Desktop · " + DesktopWho(live) : "Claude Desktop (not signed in)", canDesktop, canDesktop);
                 string codeLabel = !engine.CodeOn ? "Claude Code (not found)"
                     : !live.Code.SignedIn ? "Claude Code (not signed in)"
-                    : live.Code.Email != null ? "Claude Code · " + live.Code.Email : "Claude Code";
-                codeBox = Tick(codeLabel, canCode, canCode);
+                    : "Claude Code · " + CodeWho(live);
+                codeBox = Tick(codeLabel, canCode && !codeIsOther, canCode && !codeIsOther);
                 body.Children.Add(desktopBox);
                 body.Children.Add(codeBox);
 
-                if (canDesktop && canCode && live.DesktopUuid != null && live.Code.Uuid != null && live.DesktopUuid != live.Code.Uuid)
-                    body.Children.Add(Note("Claude Desktop and Claude Code look like they're signed in to different accounts right now. Untick the one that doesn't belong to this account.", true));
+                if (codeIsOther)
+                {
+                    body.Children.Add(Note("Claude Code is signed in to a different Claude account, so it's left out: each saved account holds one Claude account. To save Claude Code on its own, untick Claude Desktop.", false));
+                    var code = codeBox;
+                    desktopBox.Checked += (s, e) => { code.IsChecked = false; code.IsEnabled = false; };
+                    desktopBox.Unchecked += (s, e) => { code.IsEnabled = true; };
+                }
                 if (existing != null && IsDifferentAccount(existing, live))
                     body.Children.Add(Note("Claude is signed in to a different account right now. This will replace the saved sign-in of “" + existing.Name + "”.", true));
                 else if (existing == null && match != null)
@@ -481,8 +581,13 @@ namespace ClaudeSwitch
             string name = nameBox.Text.Trim();
             if (name.Length == 0) name = suggested;
 
+            // Saving Claude Code on its own goes to the account that Claude Code is signed in to.
+            Account target = existing ?? (d ? match : engine.FindSaved(new LiveState { Code = live.Code }));
+            if (target != match && nameBox.Text.Trim() == suggested)
+                name = target != null ? target.Name : (live.Code.Email ?? suggested);
+
             SaveResult saved = null;
-            bool ok = await RunBusy("Saving…", progress => { saved = engine.SaveCurrent(match, name, d, c, progress); });
+            bool ok = await RunBusy("Saving…", progress => { saved = engine.SaveCurrent(target, name, d, c, progress); });
             if (!ok || saved == null) return;
             if (saved.Notes.Count > 0) await Alert("Saved “" + saved.Account.Name + "”", string.Join("\n\n", saved.Notes));
             else Toast("Saved “" + saved.Account.Name + "”");
@@ -631,6 +736,98 @@ namespace ClaudeSwitch
             return true;
         }
 
+        // ---- repair and updates -------------------------------------------------------------------
+
+        /// <summary>Fixes saved accounts that mix two Claude accounts (possible in version 1.0.0).</summary>
+        async Task RunRepair()
+        {
+            List<string> notes;
+            try
+            {
+                notes = engine.RepairMixedAccounts();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Repairing saved accounts failed", ex);
+                return;
+            }
+            if (notes.Count == 0) return;
+            Refresh();
+            notes.Add("Each saved account now holds one Claude account. To switch Claude Code along with an account, sign in to Claude Code with that same account, then choose ⋯ → Update saved sign-in.");
+            await Alert("Fixed a mix-up in your saved accounts", string.Join("\n\n", notes));
+        }
+
+        async Task CheckForUpdates(bool manual)
+        {
+            if (checkingUpdate || installedUpdate != null) return;
+            if (!manual && !engine.Settings.AutoUpdate) return;
+            // Test mode never goes online unless a test feed is given.
+            if (Env.NoProcess && Env.Get("CLAUDESWITCH_UPDATE_FEED") == null) return;
+
+            checkingUpdate = true;
+            SetUpdateStatus("Checking for updates…");
+            UpdateInfo found = null;
+            bool installed = false;
+            string error = null;
+            try
+            {
+                await Task.Run(() =>
+                {
+                    found = Updater.Check();
+                    if (!Updater.IsNewer(found)) return;
+                    w.Dispatcher.BeginInvoke(new Action(() => SetUpdateStatus("Downloading version " + Updater.Display(found.Version) + "…")));
+                    Updater.Install(found, Updater.ExePath);
+                    installed = true;
+                });
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Update failed", ex);
+                error = ex is System.Net.WebException ? "Couldn't reach GitHub to check for updates." : ex.Message;
+            }
+            checkingUpdate = false;
+
+            if (installed)
+            {
+                installedUpdate = found;
+                SetUpdateStatus("Version " + Updater.Display(found.Version) + " is installed. Restart ClaudeSwitch to use it.");
+                El<TextBlock>("UpdateBannerTitle").Text = "ClaudeSwitch " + Updater.Display(found.Version) + " is ready";
+                El<Border>("UpdateBanner").Visibility = Visibility.Visible;
+            }
+            else if (error != null)
+            {
+                SetUpdateStatus(error);
+                if (manual) Toast(error);
+            }
+            else
+            {
+                SetUpdateStatus("You have the latest version.");
+                if (manual) Toast("You have the latest version.");
+            }
+        }
+
+        void SetUpdateStatus(string text)
+        {
+            updateStatus = text;
+            El<TextBlock>("UpdateStatusText").Text = "Version " + Updater.CurrentText + ". " + text;
+        }
+
+        /// <summary>Starts the newly installed version and closes this one.</summary>
+        void RestartIntoUpdate()
+        {
+            if (busy || installedUpdate == null) return;
+            try
+            {
+                Process.Start(new ProcessStartInfo(Updater.ExePath, Program.AfterUpdateArg) { UseShellExecute = false });
+                Application.Current.Shutdown();
+            }
+            catch (Exception ex)
+            {
+                Log.Error("Restarting into the update failed", ex);
+                Toast("Couldn't restart. Close ClaudeSwitch and open it again to finish updating.");
+            }
+        }
+
         // ---- settings -----------------------------------------------------------------------------
 
         void ShowSettings(bool show)
@@ -652,6 +849,9 @@ namespace ClaudeSwitch
                 El<CheckBox>("ManageDesktopToggle").IsChecked = engine.Settings.ManageDesktop;
                 El<CheckBox>("ReopenToggle").IsChecked = engine.Settings.ReopenDesktop;
                 El<CheckBox>("ManageCodeToggle").IsChecked = engine.Settings.ManageCode;
+                El<CheckBox>("AutoUpdateToggle").IsChecked = engine.Settings.AutoUpdate;
+                El<TextBlock>("UpdateStatusText").Text = "Version " + Updater.CurrentText + ". "
+                    + (updateStatus.Length > 0 ? updateStatus : "New versions come from this project's GitHub releases.");
                 El<TextBlock>("DesktopPathText").Text = engine.Desktop.Found ? engine.Desktop.DataDir : "Not found. Click “Change…” to pick it.";
                 El<TextBlock>("CodePathText").Text = engine.Code.Found ? engine.Code.CredentialsPath : "Not found (Claude Code isn't installed here).";
                 El<Button>("DesktopAutoBtn").Visibility = string.IsNullOrEmpty(engine.Settings.DesktopDataDir) ? Visibility.Collapsed : Visibility.Visible;

@@ -14,7 +14,11 @@ namespace ClaudeSwitch
             ManageDesktop = true;
             ManageCode = true;
             ReopenDesktop = true;
+            AutoUpdate = true;
         }
+
+        /// <summary>Install new versions from GitHub automatically.</summary>
+        public bool AutoUpdate { get; set; }
 
         /// <summary>"system", "light" or "dark".</summary>
         public string Theme { get; set; }

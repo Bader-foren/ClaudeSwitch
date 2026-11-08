@@ -144,6 +144,75 @@ namespace ClaudeSwitch
             return -1;
         }
 
+        /// <summary>
+        /// True when config.json holds Claude Desktop's sign-in tokens. Claude writes these the moment you sign in,
+        /// while a new session cookie can take up to 30 seconds to reach the disk.
+        /// </summary>
+        public bool HasAuthTokens() { return Found && HasAuthTokensIn(DataDir); }
+
+        public static bool HasAuthTokensIn(string dir)
+        {
+            try
+            {
+                string p = Path.Combine(dir, ConfigFile);
+                if (!File.Exists(p)) return false;
+                string text = FileUtil.ReadText(p);
+                foreach (string key in JsonText.TopLevelKeys(text))
+                {
+                    if (!key.StartsWith("oauth:", StringComparison.Ordinal)) continue;
+                    string raw = JsonText.GetRaw(text, key);
+                    if (raw != null && raw != "null" && raw != "\"\"" && raw != "{}" && raw != "[]") return true;
+                }
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Whether Claude Desktop is signed in: true when its sign-in tokens or its session cookie are on disk,
+        /// false when neither is, null when that can't be told (cookie file locked and no tokens).
+        /// </summary>
+        public bool? IsSignedIn()
+        {
+            if (!Found) return false;
+            if (HasAuthTokens()) return true;
+            return CookieScan(DataDir);
+        }
+
+        /// <summary>
+        /// Chromium writes changed cookies to disk up to 30 seconds after they change, and Claude Desktop has to be
+        /// force-closed (it hides in the tray). Returns how many seconds to wait so a fresh sign-in isn't lost.
+        /// </summary>
+        public static int CookieFlushWait(bool hasTokens, DateTime configWriteUtc, DateTime cookiesWriteUtc, DateTime nowUtc)
+        {
+            if (!hasTokens || cookiesWriteUtc >= configWriteUtc) return 0;
+            double left = (configWriteUtc.AddSeconds(33) - nowUtc).TotalSeconds;
+            if (left <= 0) return 0;
+            return (int)Math.Ceiling(Math.Min(left, 33));
+        }
+
+        /// <summary>Call while Claude Desktop is still open: waits until a fresh sign-in has been written to disk.</summary>
+        public void WaitForFreshSignIn(Action<string> progress)
+        {
+            if (!Found) return;
+            string config = Path.Combine(DataDir, ConfigFile);
+            string cookies = new[] { @"Network\Cookies", "Cookies" }.Select(r => Path.Combine(DataDir, r)).FirstOrDefault(File.Exists);
+            if (!File.Exists(config) || cookies == null) return;
+            bool tokens = HasAuthTokens();
+            DateTime configTime = File.GetLastWriteTimeUtc(config);
+            var sw = Stopwatch.StartNew();
+            while (sw.Elapsed.TotalSeconds < 40)
+            {
+                int wait = CookieFlushWait(tokens, configTime, File.GetLastWriteTimeUtc(cookies), DateTime.UtcNow);
+                if (wait <= 0) return;
+                progress("Letting Claude finish saving your sign-in… " + wait + "s");
+                Thread.Sleep(1000);
+            }
+        }
+
         // ---- snapshots (Claude Desktop must be closed) -------------------------------------------
 
         public void CaptureTo(string destDir)

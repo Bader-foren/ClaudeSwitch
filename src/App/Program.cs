@@ -9,6 +9,9 @@ namespace ClaudeSwitch
 {
     internal static class Program
     {
+        /// <summary>Passed to the new version when ClaudeSwitch restarts itself after an update.</summary>
+        public const string AfterUpdateArg = "--after-update";
+
         [DllImport("user32.dll")]
         static extern bool ShowWindow(IntPtr hwnd, int cmd);
 
@@ -16,18 +19,28 @@ namespace ClaudeSwitch
         static extern bool SetForegroundWindow(IntPtr hwnd);
 
         [STAThread]
-        static int Main()
+        static int Main(string[] args)
         {
+            bool afterUpdate = Array.IndexOf(args, AfterUpdateArg) >= 0;
+
             // One copy at a time: starting it again just brings the open window to the front.
             string mutexName = "Local\\ClaudeSwitch.SingleInstance" + (Env.Get("CLAUDESWITCH_DATA") != null ? ".custom" : "");
-            bool created;
-            using (var mutex = new Mutex(true, mutexName, out created))
+            bool owned;
+            using (var mutex = new Mutex(true, mutexName, out owned))
             {
-                if (!created)
+                if (!owned && afterUpdate)
+                {
+                    // Restarting after an update: the previous version is still closing, so wait for it.
+                    try { owned = mutex.WaitOne(TimeSpan.FromSeconds(15)); }
+                    catch (AbandonedMutexException) { owned = true; }
+                }
+                if (!owned)
                 {
                     ActivateExisting();
                     return 0;
                 }
+
+                Updater.CleanUp(Updater.ExePath);
 
                 var app = new Application { ShutdownMode = ShutdownMode.OnMainWindowClose };
                 app.DispatcherUnhandledException += (s, e) =>
@@ -44,7 +57,7 @@ namespace ClaudeSwitch
 
                 try
                 {
-                    var ui = new MainWindowController();
+                    var ui = new MainWindowController(afterUpdate);
                     return app.Run(ui.Window);
                 }
                 catch (Exception ex)

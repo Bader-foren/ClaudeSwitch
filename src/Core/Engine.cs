@@ -10,6 +10,9 @@ namespace ClaudeSwitch
         public string DesktopUuid;
         public bool? DesktopSignedIn;
         public CodeIdentity Code = new CodeIdentity();
+
+        /// <summary>Claude Desktop is signed in to a known account.</summary>
+        public bool DesktopIn { get { return DesktopUuid != null && DesktopSignedIn != false; } }
     }
 
     internal sealed class SaveResult
@@ -59,7 +62,7 @@ namespace ClaudeSwitch
             if (Desktop.Found)
             {
                 s.DesktopUuid = Desktop.ReadAccountUuid();
-                if (checkCookies) s.DesktopSignedIn = Desktop.HasSessionCookie();
+                s.DesktopSignedIn = Desktop.HasAuthTokens() ? true : checkCookies ? Desktop.HasSessionCookie() : (bool?)null;
             }
             if (Code.Found) s.Code = Code.ReadLive();
             return s;
@@ -69,16 +72,11 @@ namespace ClaudeSwitch
         public Account FindActive(LiveState live)
         {
             if (Settings.Pending != null) return null;
-            if (DesktopOn && live.DesktopUuid != null)
-            {
-                var a = Accounts.FirstOrDefault(x => x.HasDesktop && x.DesktopUuid == live.DesktopUuid);
-                if (a != null) return a;
-            }
+            // When Claude Desktop is signed in, it decides which account is active.
+            if (DesktopOn && live.DesktopIn)
+                return Accounts.FirstOrDefault(x => x.HasDesktop && x.DesktopUuid == live.DesktopUuid);
             if (CodeOn && live.Code.SignedIn && live.Code.Uuid != null)
-            {
-                var a = Accounts.FirstOrDefault(x => x.HasCode && x.CodeUuid == live.Code.Uuid);
-                if (a != null) return a;
-            }
+                return Accounts.FirstOrDefault(x => x.HasCode && x.CodeUuid == live.Code.Uuid);
             if (live.DesktopUuid == null && live.Code.Uuid == null)
                 return Accounts.FirstOrDefault(x => x.Id == Settings.ActiveAccountId);
             return null;
@@ -87,16 +85,11 @@ namespace ClaudeSwitch
         /// <summary>A saved account that matches what is signed in now (to avoid saving the same account twice).</summary>
         public Account FindSaved(LiveState live)
         {
-            if (DesktopOn && live.DesktopUuid != null)
-            {
-                var a = Accounts.FirstOrDefault(x => x.DesktopUuid == live.DesktopUuid);
-                if (a != null) return a;
-            }
+            // When Claude Desktop is signed in, it decides which saved account this is.
+            if (DesktopOn && live.DesktopIn)
+                return Accounts.FirstOrDefault(x => x.DesktopUuid == live.DesktopUuid);
             if (CodeOn && live.Code.SignedIn && live.Code.Uuid != null)
-            {
-                var a = Accounts.FirstOrDefault(x => x.CodeUuid == live.Code.Uuid);
-                if (a != null) return a;
-            }
+                return Accounts.FirstOrDefault(x => x.CodeUuid == live.Code.Uuid || x.DesktopUuid == live.Code.Uuid);
             return null;
         }
 
@@ -119,10 +112,12 @@ namespace ClaudeSwitch
                 if (includeDesktop && Desktop.Found)
                 {
                     image = DesktopProcess.RunningImage();
+                    // Claude has to be force-closed; give a fresh sign-in time to reach the disk first.
+                    if (image != null) Desktop.WaitForFreshSignIn(progress);
                     reopen = DesktopProcess.Close(progress);
                     closed = true;
                     progress("Saving Claude Desktop sign-in…");
-                    if (Desktop.HasSessionCookie() == false)
+                    if (Desktop.IsSignedIn() == false)
                     {
                         result.Notes.Add("Claude Desktop isn't signed in, so its sign-in wasn't saved.");
                     }
@@ -132,6 +127,9 @@ namespace ClaudeSwitch
                         acc.HasDesktop = true;
                         acc.DesktopUuid = Desktop.ReadAccountUuid();
                         desktopSaved = true;
+                        if (Desktop.HasSessionCookie() == false)
+                            result.Notes.Add("Claude hadn't finished saving this sign-in yet. If Claude asks you to sign in after you switch to “"
+                                + acc.Name + "”, sign in once, then choose ⋯ → Update saved sign-in.");
                     }
                 }
 
@@ -139,16 +137,23 @@ namespace ClaudeSwitch
                 {
                     progress("Saving Claude Code sign-in…");
                     var id = Code.ReadLive();
-                    if (id.SignedIn && CaptureCode(acc))
+                    // One saved account holds one Claude account: never mix in Claude Code from another account.
+                    bool otherAccount = acc.HasDesktop && acc.DesktopUuid != null && id.Uuid != null && id.Uuid != acc.DesktopUuid;
+                    if (!id.SignedIn)
+                    {
+                        result.Notes.Add("Claude Code isn't signed in, so its sign-in wasn't saved.");
+                    }
+                    else if (otherAccount)
+                    {
+                        result.Notes.Add("Claude Code is signed in to a different Claude account" + (id.Email != null ? " (" + id.Email + ")" : "")
+                            + ", so it wasn't added to “" + acc.Name + "”.");
+                    }
+                    else if (CaptureCode(acc))
                     {
                         acc.HasCode = true;
                         acc.CodeUuid = id.Uuid;
                         acc.CodeEmail = id.Email;
                         codeSaved = true;
-                    }
-                    else
-                    {
-                        result.Notes.Add("Claude Code isn't signed in, so its sign-in wasn't saved.");
                     }
                 }
 
@@ -398,7 +403,74 @@ namespace ClaudeSwitch
             Log.Info("Removed account " + a.Id);
         }
 
+        /// <summary>
+        /// Version 1.0.0 could save Claude Desktop and Claude Code from two different Claude accounts into one saved
+        /// account. Moves each such Claude Code sign-in to the account it really belongs to. Returns what was fixed.
+        /// </summary>
+        public List<string> RepairMixedAccounts()
+        {
+            var notes = new List<string>();
+            foreach (var a in Accounts.ToList())
+            {
+                if (!a.HasDesktop || !a.HasCode || a.DesktopUuid == null || a.CodeUuid == null || a.DesktopUuid == a.CodeUuid) continue;
+                string from = CodeSnap(a);
+                if (!Directory.Exists(from)) continue;
+
+                string who = a.CodeEmail ?? "another account";
+                var owner = Accounts.FirstOrDefault(b => b.Id != a.Id && b.HasDesktop && b.DesktopUuid == a.CodeUuid);
+                if (owner != null && !owner.HasCode)
+                {
+                    MoveDir(from, CodeSnap(owner));
+                    owner.HasCode = true;
+                    owner.CodeUuid = a.CodeUuid;
+                    owner.CodeEmail = a.CodeEmail;
+                    owner.Email = a.CodeEmail;
+                    Store.SaveAccount(owner);
+                    notes.Add("The Claude Code sign-in for " + who + " was saved in “" + a.Name + "”, but it belongs to “" + owner.Name + "”. It's now saved there.");
+                }
+                else if (owner != null)
+                {
+                    MoveDir(from, Path.Combine(Store.NewBackupDir("mixed-code", PendingDir), "code"));
+                    notes.Add("Removed an extra Claude Code sign-in (" + who + ") from “" + a.Name + "”. “" + owner.Name + "” already has it.");
+                }
+                else
+                {
+                    var own = new Account
+                    {
+                        Id = Util.NewId(),
+                        Name = a.CodeEmail ?? "Claude Code account",
+                        Color = NextColor(),
+                        CreatedAt = Util.Now(),
+                        Order = NextOrder(),
+                        HasCode = true,
+                        CodeUuid = a.CodeUuid,
+                        CodeEmail = a.CodeEmail,
+                        Email = a.CodeEmail
+                    };
+                    MoveDir(from, CodeSnap(own));
+                    Store.SaveAccount(own);
+                    Accounts.Add(own);
+                    notes.Add("The Claude Code sign-in for " + who + " was saved in “" + a.Name + "”, but it's a different Claude account. It's now its own account.");
+                }
+
+                a.HasCode = false;
+                a.CodeUuid = null;
+                a.CodeEmail = null;
+                Store.SaveAccount(a);
+                Log.Info("Repaired mixed account " + a.Id);
+            }
+            if (notes.Count > 0) Accounts = Store.LoadAccounts();
+            return notes;
+        }
+
         // ---- helpers -----------------------------------------------------------------------------
+
+        static void MoveDir(string from, string to)
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(to));
+            FileUtil.Delete(to);
+            FileUtil.Retry(() => Directory.Move(from, to));
+        }
 
         static string DesktopSnap(Account a) { return Path.Combine(Store.AccountDir(a.Id), "desktop"); }
         static string CodeSnap(Account a) { return Path.Combine(Store.AccountDir(a.Id), "code"); }

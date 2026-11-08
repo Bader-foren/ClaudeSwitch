@@ -23,8 +23,9 @@ Add your Claude accounts once, then switch between them with one click.
 - **Small**: one ~250 KB `.exe`, nothing to install, no admin rights.
 - **Safe by design**: before anything is replaced, the current sign-in is copied somewhere safe first
   (into its saved account, so refreshed tokens are kept, or into a backup folder).
+- **Updates itself**: new versions arrive automatically from this project's GitHub releases.
 - **Private**: everything stays on your PC. Claude Code tokens are encrypted with your Windows account (DPAPI).
-  ClaudeSwitch never connects to the internet.
+  The only thing ClaudeSwitch does online is check this project's GitHub releases for updates.
 
 ## How to use
 
@@ -40,10 +41,12 @@ Add your Claude accounts once, then switch between them with one click.
 
 Each account has a **⋯** menu with **Rename**, **Update saved sign-in** and **Remove**.
 
-### Two important tips
+### Good to know
 
 - **Don't use "Log out" inside Claude** to change accounts. Logging out ends that session on Anthropic's side,
   so its saved copy would stop working. Use **Add account → Sign in with another account** instead.
+- **One saved account = one Claude account.** If Claude Desktop and Claude Code are signed in to different
+  Claude accounts, ClaudeSwitch keeps them apart instead of mixing them into one saved account.
 - After switching, **restart any open Claude Code sessions** (terminal windows running `claude`),
   because a running session keeps the account it started with.
 
@@ -54,6 +57,24 @@ and double-click it. There is nothing to install.
 
 Windows may show "Windows protected your PC" the first time, because the app isn't code-signed.
 Click **More info → Run anyway**. You can also build it yourself from this source code (below).
+
+## Updates
+
+ClaudeSwitch keeps itself up to date. When it opens, and every 6 hours while it's open, it checks this project's
+[releases](https://github.com/Bader-foren/ClaudeSwitch/releases). If there's a newer version, it downloads
+`ClaudeSwitch.exe`, checks it against the SHA-256 checksum GitHub publishes for that file, and puts it in place.
+Click **Restart now**, or just open ClaudeSwitch again later. You can turn this off in Settings → Updates.
+
+Version 1.0.0 can't update itself. If you have it, download the latest release once. After that, updates are automatic.
+
+**Publishing a new version** (maintainers): raise the version in `src/AssemblyInfo.cs`, run `build.cmd`, then:
+
+```bat
+gh release create v1.2.3 bin\ClaudeSwitch.exe --title "ClaudeSwitch 1.2.3"
+```
+
+The tag must match the version, and the file must be named `ClaudeSwitch.exe`. If you fork ClaudeSwitch,
+change `Repo` in `src/Core/Updater.cs` so your copies update from your own releases.
 
 ## Build it yourself
 
@@ -123,6 +144,7 @@ so the copies only work for your Windows user on this PC.
 - `DesktopDataDir`: force a Claude Desktop data folder (also in Settings → Change…).
 - `DesktopItems`: the list of Claude Desktop files/folders to swap, if a future Claude version moves its sign-in.
 - `ReopenDesktop`: whether to open Claude Desktop after switching.
+- `AutoUpdate`: whether to install new versions automatically (also in Settings → Updates).
 
 For development and tests, these environment variables point ClaudeSwitch at other folders:
 `CLAUDESWITCH_DATA`, `CLAUDESWITCH_DESKTOP_DIR`, `CLAUDESWITCH_CODE_DIR`, `CLAUDESWITCH_CODE_CONFIG`.
@@ -131,7 +153,7 @@ For development and tests, these environment variables point ClaudeSwitch at oth
 ## Project layout
 
 ```
-src/Core/     switching engine (no UI): Claude Desktop, Claude Code, storage, JSON editing
+src/Core/     engine (no UI): Claude Desktop, Claude Code, storage, JSON editing, updates
 src/App/      the WPF window: MainWindow.xaml, MainWindow.cs, Theme.cs, Program.cs
 tests/        engine self-test (build.cmd test)
 tools/        make-icon.ps1 (draws assets/icon.ico)

@@ -2,6 +2,8 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
 using System.Text;
 
 namespace ClaudeSwitch.Tests
@@ -21,7 +23,7 @@ namespace ClaudeSwitch.Tests
 
         static int Main(string[] args)
         {
-            root = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "claudeswitch-selftest");
+            root = args.FirstOrDefault(a => !a.StartsWith("--")) ?? Path.Combine(Path.GetTempPath(), "claudeswitch-selftest");
             if (Directory.Exists(root)) Directory.Delete(root, true);
             desktop = Path.Combine(root, "desktop");
             codeDir = Path.Combine(root, "home", ".claude");
@@ -39,7 +41,10 @@ namespace ClaudeSwitch.Tests
             try
             {
                 JsonTests();
+                SignInCheckTests();
                 EngineTests();
+                UpdaterTests();
+                if (args.Contains("--net")) NetTests();
             }
             catch (Exception ex)
             {
@@ -84,6 +89,123 @@ namespace ClaudeSwitch.Tests
             Check(JsonText.GetRaw("{\"outer\": {\"inner\": 1}}", "inner") == null, "nested keys are not mistaken for top-level ones");
         }
 
+        // ---- sign-in check ------------------------------------------------------------------------
+
+        static void SignInCheckTests()
+        {
+            Section("Recognising a Claude Desktop sign-in");
+            string dir = Path.Combine(root, "signin-check");
+            Directory.CreateDirectory(dir);
+            File.WriteAllText(Path.Combine(dir, "config.json"), "{\"locale\": \"en\", \"oauth:tokenCacheV2\": \"\"}");
+            Check(!DesktopClient.HasAuthTokensIn(dir), "an empty token cache means signed out");
+            File.WriteAllText(Path.Combine(dir, "config.json"), "{\"locale\": \"en\", \"oauth:tokenCacheV2\": \"djEwAAAA\"}");
+            Check(DesktopClient.HasAuthTokensIn(dir), "a token cache means signed in");
+
+            var t0 = new DateTime(2026, 1, 1, 12, 0, 0, DateTimeKind.Utc);
+            Check(DesktopClient.CookieFlushWait(true, t0, t0.AddSeconds(-5), t0.AddSeconds(10)) == 23, "waits for Claude to save a sign-in from 10 seconds ago");
+            Check(DesktopClient.CookieFlushWait(true, t0, t0.AddSeconds(2), t0.AddSeconds(10)) == 0, "no wait once the cookies were saved after the sign-in");
+            Check(DesktopClient.CookieFlushWait(true, t0, t0.AddSeconds(-5), t0.AddSeconds(40)) == 0, "no wait for an older sign-in");
+            Check(DesktopClient.CookieFlushWait(false, t0, t0.AddSeconds(-5), t0.AddSeconds(10)) == 0, "no wait when not signed in");
+        }
+
+        // ---- updates ------------------------------------------------------------------------------
+
+        static void UpdaterTests()
+        {
+            Section("Automatic updates");
+            Version v;
+            Check(Updater.TryParseTag("v1.2.3", out v) && v == new Version(1, 2, 3, 0), "reads release tags like v1.2.3");
+            Check(!Updater.TryParseTag("latest", out v), "ignores tags that aren't versions");
+
+            string dir = Path.Combine(root, "update");
+            string app = Path.Combine(dir, "app");
+            string feedDir = Path.Combine(dir, "feed");
+            Directory.CreateDirectory(app);
+            Directory.CreateDirectory(feedDir);
+            string newExe = Path.Combine(feedDir, "ClaudeSwitch.exe");
+            Check(CompileFakeApp(newExe, "9.9.9.0"), "a fake new version is built for the test");
+            string exe = Path.Combine(app, "ClaudeSwitch.exe");
+            File.WriteAllText(exe, "old version"); // stands in for the running ClaudeSwitch.exe
+            string feed = Path.Combine(feedDir, "latest.json");
+
+            Environment.SetEnvironmentVariable("CLAUDESWITCH_CURRENT_VERSION", "1.0.1");
+            Environment.SetEnvironmentVariable("CLAUDESWITCH_UPDATE_FEED", new Uri(feed).AbsoluteUri);
+            try
+            {
+                WriteFeed(feed, "v9.9.9", newExe, Sha256(newExe));
+                var info = Updater.Check();
+                Check(info != null && info.Version == new Version(9, 9, 9, 0) && Updater.IsNewer(info), "finds the newer release");
+                Updater.Install(info, exe);
+                Check(AssemblyName.GetAssemblyName(exe).Version == new Version(9, 9, 9, 0), "the new version replaces the exe");
+                Check(File.Exists(exe + ".old") && File.ReadAllText(exe + ".old") == "old version", "the previous version is kept until the next start");
+                Updater.CleanUp(exe);
+                Check(!File.Exists(exe + ".old") && File.Exists(exe), "leftovers are removed on the next start");
+
+                WriteFeed(feed, "v9.9.10", newExe, new string('0', 64));
+                bool refused = false;
+                try { Updater.Install(Updater.Check(), exe); }
+                catch (InvalidOperationException) { refused = true; }
+                Check(refused && AssemblyName.GetAssemblyName(exe).Version == new Version(9, 9, 9, 0) && !File.Exists(exe + ".download"),
+                    "a download that doesn't match GitHub's checksum is refused and nothing changes");
+
+                WriteFeed(feed, "v9.9.10", newExe, Sha256(newExe));
+                refused = false;
+                try { Updater.Install(Updater.Check(), exe); }
+                catch (InvalidOperationException) { refused = true; }
+                Check(refused, "a file that isn't the promised version is refused");
+
+                WriteFeed(feed, "v1.0.0", newExe, Sha256(newExe));
+                Check(!Updater.IsNewer(Updater.Check()), "never goes back to an older version");
+            }
+            finally
+            {
+                Environment.SetEnvironmentVariable("CLAUDESWITCH_UPDATE_FEED", null);
+                Environment.SetEnvironmentVariable("CLAUDESWITCH_CURRENT_VERSION", null);
+            }
+        }
+
+        /// <summary>Talks to the real GitHub releases: build.cmd test [dir] --net</summary>
+        static void NetTests()
+        {
+            Section("Real GitHub release (--net)");
+            var info = Updater.Check();
+            Check(info != null && info.AssetUrl != null && info.AssetUrl.StartsWith("https://") && info.Sha256 != null && info.Sha256.Length == 64,
+                "GitHub returns the latest release with ClaudeSwitch.exe and its checksum");
+            if (info == null) return;
+            Console.WriteLine("        latest release on GitHub: " + info.Tag);
+            string dir = Path.Combine(root, "net-update");
+            Directory.CreateDirectory(dir);
+            string exe = Path.Combine(dir, "ClaudeSwitch.exe");
+            File.WriteAllText(exe, "placeholder");
+            Updater.Install(info, exe);
+            Check(AssemblyName.GetAssemblyName(exe).Name == "ClaudeSwitch", "downloads the release over https and verifies it");
+        }
+
+        static void WriteFeed(string feed, string tag, string assetPath, string sha256)
+        {
+            File.WriteAllText(feed, "{\"tag_name\": " + JsonText.Quote(tag) + ", \"assets\": [{\"name\": \"ClaudeSwitch.exe\", \"browser_download_url\": "
+                + JsonText.Quote(new Uri(assetPath).AbsoluteUri) + ", \"digest\": \"sha256:" + sha256 + "\"}]}");
+        }
+
+        static string Sha256(string path)
+        {
+            using (var sha = SHA256.Create())
+            using (var stream = File.OpenRead(path))
+                return BitConverter.ToString(sha.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+        }
+
+        static bool CompileFakeApp(string output, string version)
+        {
+            using (var provider = new Microsoft.CSharp.CSharpCodeProvider())
+            {
+                var options = new System.CodeDom.Compiler.CompilerParameters { GenerateExecutable = true, OutputAssembly = output };
+                options.ReferencedAssemblies.Add("System.dll");
+                var result = provider.CompileAssemblyFromSource(options,
+                    "[assembly: System.Reflection.AssemblyVersion(\"" + version + "\")] class P { static void Main() { } }");
+                return !result.Errors.HasErrors;
+            }
+        }
+
         // ---- fake Claude installs -----------------------------------------------------------------
 
         static void WriteDesktopInstall()
@@ -124,6 +246,13 @@ namespace ClaudeSwitch.Tests
             string account = "{\n    \"accountUuid\": \"uuid-" + tag + "\",\n    \"emailAddress\": \"" + tag.ToLowerInvariant()
                 + "@example.com\",\n    \"displayName\": \"" + tag + "\"\n  }";
             File.WriteAllText(codeCfg, JsonText.SetRaw(LiveCodeCfg(), "oauthAccount", account));
+        }
+
+        /// <summary>Signed in, but Chromium hasn't written the new session cookie to disk yet.</summary>
+        static void SignInDesktopNotFlushed(string tag)
+        {
+            SignInDesktop(tag);
+            File.WriteAllBytes(Path.Combine(desktop, "Network", "Cookies"), Encoding.ASCII.GetBytes("SQLite format 3\0 claude.ai __cf_bm"));
         }
 
         static string LiveCookies()
@@ -252,26 +381,60 @@ namespace ClaudeSwitch.Tests
             catch (UserMessageException) { refused = true; }
             Check(refused && e.Settings.Pending != null && e.Accounts.Count == 2, "nothing saved, still waiting for the sign-in");
 
-            Section("New account signed in to Claude Desktop only");
-            SignInDesktop("C");
+            Section("A fresh sign-in is saved even before Claude writes its cookie to disk");
+            SignInDesktopNotFlushed("C");
+            Check(e.Desktop.HasSessionCookie() == false && e.Desktop.IsSignedIn() == true, "the sign-in is recognised from Claude's tokens");
             var carolResult = e.SaveCurrent(null, "Carol", true, true, Quiet);
-            Check(carolResult.Account.HasDesktop && !carolResult.Account.HasCode, "Carol saved with Desktop only");
+            Check(carolResult.Account.HasDesktop && !carolResult.Account.HasCode, "Carol saved with Claude Desktop only");
             Check(LiveCreds() != null && LiveCreds().Contains("at-A"), "Claude Code put back to the previous account");
             Check(carolResult.Notes.Count > 0, "the user is told what happened");
+
+            Section("Claude Desktop and Claude Code signed in to different accounts");
+            // Now Claude Desktop is Carol and Claude Code is Alice.
+            var mixedLive = e.ReadLive(false);
+            var activeNow = e.FindActive(mixedLive);
+            Check(activeNow != null && activeNow.Name == "Carol", "Claude Desktop decides which account is active");
+            var savedNow = e.FindSaved(mixedLive);
+            Check(savedNow != null && savedNow.Name == "Carol", "Claude Desktop decides which saved account this is");
+            var mixedResult = e.SaveCurrent(Find(e, "Carol"), "Carol", true, true, Quiet);
+            Check(!mixedResult.Account.HasCode && mixedResult.Notes.Any(n => n.Contains("different Claude account")),
+                "Claude Code from another account is never mixed in");
+
+            Section("Mixed accounts saved by version 1.0.0 are repaired");
+            var bobMixed = Find(e, "Bob");
+            bobMixed.CodeUuid = "uuid-C"; // pretend Bob's saved Claude Code sign-in is really Carol's
+            bobMixed.CodeEmail = "c@example.com";
+            Store.SaveAccount(bobMixed);
+            var aliceMixed = Find(e, "Alice");
+            aliceMixed.CodeUuid = "uuid-Z"; // and Alice's belongs to an account that isn't saved
+            aliceMixed.CodeEmail = "z@example.com";
+            Store.SaveAccount(aliceMixed);
+            e.Reload();
+            var repairs = e.RepairMixedAccounts();
+            Check(repairs.Count == 2, "both mix-ups are found");
+            var carolFixed = Find(e, "Carol");
+            Check(carolFixed.HasCode && carolFixed.CodeUuid == "uuid-C" && carolFixed.Email == "c@example.com"
+                  && Directory.Exists(Path.Combine(AccountDir(carolFixed), "code")), "a Claude Code sign-in moves to the account it belongs to");
+            var bobFixed = Find(e, "Bob");
+            Check(!bobFixed.HasCode && !Directory.Exists(Path.Combine(AccountDir(bobFixed), "code")), "and leaves the wrong account");
+            var zed = Find(e, "z@example.com");
+            Check(zed != null && zed.HasCode && !zed.HasDesktop && !Find(e, "Alice").HasCode,
+                "a Claude Code sign-in with no matching account becomes its own account");
+            Check(e.RepairMixedAccounts().Count == 0, "running the repair again changes nothing");
 
             Section("Rename and remove");
             e.Rename(Find(e, "Carol"), "  Carol W  ");
             e.Reload();
             Check(Find(e, "Carol W") != null, "rename");
             e.Delete(Find(e, "Carol W"));
-            Check(e.Accounts.Count == 2 && Find(e, "Carol W") == null, "remove");
+            Check(e.Accounts.Count == 3 && Find(e, "Carol W") == null, "remove");
 
             Section("Files stay valid");
             byte[] cfgBytes = File.ReadAllBytes(codeCfg);
             Check(!(cfgBytes.Length >= 3 && cfgBytes[0] == 0xEF && cfgBytes[1] == 0xBB && cfgBytes[2] == 0xBF), ".claude.json has no BOM");
             Check(JsonText.Serializer().DeserializeObject(LiveCodeCfg()) is Dictionary<string, object>, ".claude.json is valid JSON");
             Check(JsonText.Serializer().DeserializeObject(LiveConfig()) is Dictionary<string, object>, "config.json is valid JSON");
-            Check(new Engine().Accounts.Count == 2, "accounts load again from disk");
+            Check(new Engine().Accounts.Count == 3, "accounts load again from disk");
         }
     }
 }
