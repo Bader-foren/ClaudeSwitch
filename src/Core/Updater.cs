@@ -121,44 +121,52 @@ namespace ClaudeSwitch
         /// </summary>
         public static void Install(UpdateInfo u, string exePath)
         {
-            if (u == null || string.IsNullOrEmpty(u.AssetUrl)) throw new InvalidOperationException("The new release doesn't include ClaudeSwitch.exe.");
-            if (string.IsNullOrEmpty(u.Sha256)) throw new InvalidOperationException("GitHub didn't publish a checksum for the update, so it wasn't installed.");
+            if (u == null || string.IsNullOrEmpty(u.AssetUrl)) throw new UserMessageException("The new release doesn't include ClaudeSwitch.exe.");
+            if (string.IsNullOrEmpty(u.Sha256)) throw new UserMessageException("GitHub didn't publish a checksum for the update, so it wasn't installed.");
             var uri = new Uri(u.AssetUrl);
             if (uri.Scheme != Uri.UriSchemeHttps && !(TestFeed && uri.IsFile))
-                throw new InvalidOperationException("The update isn't on a secure (https) address, so it wasn't installed.");
+                throw new UserMessageException("The update isn't on a secure (https) address, so it wasn't installed.");
 
             string download = exePath + ".download";
-            FileUtil.Delete(download);
             try
             {
+                if (File.Exists(download)) File.Delete(download);
                 using (var client = new WebClient())
                 {
                     client.Headers[HttpRequestHeader.UserAgent] = UserAgent;
                     client.DownloadFile(uri, download);
                 }
                 if (!string.Equals(Sha256Of(download), u.Sha256, StringComparison.OrdinalIgnoreCase))
-                    throw new InvalidOperationException("The downloaded update didn't match GitHub's checksum, so it wasn't installed.");
+                    throw new UserMessageException("The downloaded update didn't match GitHub's checksum, so it wasn't installed.");
 
                 AssemblyName name;
                 try { name = AssemblyName.GetAssemblyName(download); }
                 catch (BadImageFormatException) { name = null; }
                 if (name == null || name.Name != ProgramName || Normalize(name.Version) != u.Version)
-                    throw new InvalidOperationException("The downloaded file isn't ClaudeSwitch " + Display(u.Version) + ", so it wasn't installed.");
+                    throw new UserMessageException("The downloaded file isn't ClaudeSwitch " + Display(u.Version) + ", so it wasn't installed.");
             }
-            catch
+            catch (Exception ex)
             {
-                try { File.Delete(download); } catch { }
+                TryDelete(download);
+                if (ex is UserMessageException) throw;
+                if (ex is WebException) throw new UserMessageException("Couldn't download the update. Check your internet connection and try again.");
+                if (ex is UnauthorizedAccessException) throw NotWritable();
                 throw;
             }
 
             // Swap: rename the current exe out of the way (allowed even while it runs), then move the new one in.
             string old = exePath + ".old";
-            if (File.Exists(old))
+            if (File.Exists(old) && !TryDelete(old)) old = exePath + ".old-" + DateTime.Now.Ticks; // an older copy still runs from it
+            try
             {
-                try { File.Delete(old); }
-                catch (Exception) { old = exePath + ".old-" + DateTime.Now.Ticks; } // an older copy is still running from it
+                File.Move(exePath, old);
             }
-            File.Move(exePath, old);
+            catch (Exception ex)
+            {
+                TryDelete(download);
+                if (ex is UnauthorizedAccessException || ex is IOException) throw NotWritable();
+                throw;
+            }
             try
             {
                 File.Move(download, exePath);
@@ -166,9 +174,28 @@ namespace ClaudeSwitch
             catch
             {
                 File.Move(old, exePath);
-                throw;
+                TryDelete(download);
+                throw NotWritable();
             }
             Log.Info("Installed update " + Display(u.Version) + " over " + CurrentText);
+        }
+
+        static bool TryDelete(string path)
+        {
+            try
+            {
+                if (File.Exists(path)) File.Delete(path);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        static UserMessageException NotWritable()
+        {
+            return new UserMessageException("ClaudeSwitch can't update itself in the folder it's in. Move ClaudeSwitch.exe to a folder you can change, such as your Desktop, and try again.");
         }
 
         /// <summary>Removes what an earlier update left behind (the previous exe, unfinished downloads).</summary>

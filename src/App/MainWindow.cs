@@ -65,7 +65,7 @@ namespace ClaudeSwitch
         bool busy, loadingSettings, checkingUpdate;
         string lastListKey;
         string updateStatus = "";
-        UpdateInfo installedUpdate;
+        UpdateInfo availableUpdate;
         Account menuAccount;
         TaskCompletionSource<string> dialogTcs;
         string dialogPrimaryId;
@@ -106,6 +106,8 @@ namespace ClaudeSwitch
             if (afterUpdate) Toast("Updated to ClaudeSwitch " + Updater.CurrentText);
             await RunRepair();
             await Task.Delay(TimeSpan.FromSeconds(3));
+            // Right after an update the previous version may still have been closing at start-up: tidy up now.
+            Updater.CleanUp(Updater.ExePath);
             await CheckForUpdates(false);
             updateTimer.Start();
         }
@@ -159,7 +161,8 @@ namespace ClaudeSwitch
             Toggle("ManageCodeToggle", v => engine.Settings.ManageCode = v);
             Toggle("AutoUpdateToggle", v => engine.Settings.AutoUpdate = v);
             El<Button>("CheckUpdatesBtn").Click += async (s, e) => await CheckForUpdates(true);
-            El<Button>("UpdateRestartBtn").Click += (s, e) => RestartIntoUpdate();
+            El<Button>("InstallUpdateBtn").Click += async (s, e) => await InstallUpdate();
+            El<Button>("WhatsNewBtn").Click += (s, e) => OpenWhatsNew();
             El<Button>("DesktopFolderBtn").Click += async (s, e) => await PickDesktopFolder();
             El<Button>("DesktopAutoBtn").Click += (s, e) =>
             {
@@ -757,9 +760,13 @@ namespace ClaudeSwitch
             await Alert("Fixed a mix-up in your saved accounts", string.Join("\n\n", notes));
         }
 
+        /// <summary>
+        /// Asks GitHub whether there's a newer version. Nothing is downloaded here: when there is one,
+        /// the Settings button gets a dot and Settings → Updates shows the Update button.
+        /// </summary>
         async Task CheckForUpdates(bool manual)
         {
-            if (checkingUpdate || installedUpdate != null) return;
+            if (checkingUpdate) return;
             if (!manual && !engine.Settings.AutoUpdate) return;
             // Test mode never goes online unless a test feed is given.
             if (Env.NoProcess && Env.Get("CLAUDESWITCH_UPDATE_FEED") == null) return;
@@ -767,40 +774,32 @@ namespace ClaudeSwitch
             checkingUpdate = true;
             SetUpdateStatus("Checking for updates…");
             UpdateInfo found = null;
-            bool installed = false;
             string error = null;
             try
             {
-                await Task.Run(() =>
-                {
-                    found = Updater.Check();
-                    if (!Updater.IsNewer(found)) return;
-                    w.Dispatcher.BeginInvoke(new Action(() => SetUpdateStatus("Downloading version " + Updater.Display(found.Version) + "…")));
-                    Updater.Install(found, Updater.ExePath);
-                    installed = true;
-                });
+                found = await Task.Run(() => Updater.Check());
             }
             catch (Exception ex)
             {
-                Log.Error("Update failed", ex);
+                Log.Error("Update check failed", ex);
                 error = ex is System.Net.WebException ? "Couldn't reach GitHub to check for updates." : ex.Message;
             }
             checkingUpdate = false;
 
-            if (installed)
-            {
-                installedUpdate = found;
-                SetUpdateStatus("Version " + Updater.Display(found.Version) + " is installed. Restart ClaudeSwitch to use it.");
-                El<TextBlock>("UpdateBannerTitle").Text = "ClaudeSwitch " + Updater.Display(found.Version) + " is ready";
-                El<Border>("UpdateBanner").Visibility = Visibility.Visible;
-            }
-            else if (error != null)
+            if (error != null)
             {
                 SetUpdateStatus(error);
                 if (manual) Toast(error);
             }
+            else if (Updater.IsNewer(found))
+            {
+                availableUpdate = found;
+                SetUpdateStatus("Version " + Updater.Display(found.Version) + " is available.");
+                if (manual) Toast("Version " + Updater.Display(found.Version) + " is available.");
+            }
             else
             {
+                availableUpdate = null;
                 SetUpdateStatus("You have the latest version.");
                 if (manual) Toast("You have the latest version.");
             }
@@ -809,13 +808,37 @@ namespace ClaudeSwitch
         void SetUpdateStatus(string text)
         {
             updateStatus = text;
-            El<TextBlock>("UpdateStatusText").Text = "Version " + Updater.CurrentText + ". " + text;
+            ShowUpdateUi();
         }
 
-        /// <summary>Starts the newly installed version and closes this one.</summary>
-        void RestartIntoUpdate()
+        /// <summary>The dot on the Settings button, and the Update button in Settings.</summary>
+        void ShowUpdateUi()
         {
-            if (busy || installedUpdate == null) return;
+            bool available = availableUpdate != null;
+            El<Ellipse>("UpdateDot").Visibility = available ? Visibility.Visible : Visibility.Collapsed;
+            El<Button>("SettingsBtn").ToolTip = available ? "Settings (update available)" : "Settings";
+            var install = El<Button>("InstallUpdateBtn");
+            install.Visibility = available ? Visibility.Visible : Visibility.Collapsed;
+            if (available) install.Content = "Update to " + Updater.Display(availableUpdate.Version);
+            El<Button>("WhatsNewBtn").Visibility = available ? Visibility.Visible : Visibility.Collapsed;
+            El<TextBlock>("UpdateStatusText").Text = "You have version " + Updater.CurrentText + ". "
+                + (updateStatus.Length > 0 ? updateStatus : "New versions come from this project's GitHub releases.");
+        }
+
+        /// <summary>The Update button: downloads and checks the new version, puts it in place and restarts into it.</summary>
+        async Task InstallUpdate()
+        {
+            var u = availableUpdate;
+            if (u == null || busy) return;
+            bool ok = await RunBusy("Downloading ClaudeSwitch " + Updater.Display(u.Version) + "…", progress =>
+            {
+                Updater.Install(u, Updater.ExePath);
+                progress("Restarting…");
+            });
+            if (!ok) return;
+
+            availableUpdate = null;
+            SetUpdateStatus("Version " + Updater.Display(u.Version) + " is installed. Restart ClaudeSwitch to use it.");
             try
             {
                 Process.Start(new ProcessStartInfo(Updater.ExePath, Program.AfterUpdateArg) { UseShellExecute = false });
@@ -826,6 +849,20 @@ namespace ClaudeSwitch
                 Log.Error("Restarting into the update failed", ex);
                 Toast("Couldn't restart. Close ClaudeSwitch and open it again to finish updating.");
             }
+        }
+
+        /// <summary>Opens the release notes of the available version on GitHub.</summary>
+        void OpenWhatsNew()
+        {
+            if (availableUpdate == null) return;
+            string url = "https://github.com/" + Updater.Repo + "/releases/tag/" + Uri.EscapeDataString(availableUpdate.Tag);
+            if (Env.NoProcess)
+            {
+                Toast("Test mode: not opening " + url);
+                return;
+            }
+            try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); }
+            catch (Exception ex) { Log.Error("Opening the release page failed", ex); }
         }
 
         // ---- settings -----------------------------------------------------------------------------
@@ -850,8 +887,7 @@ namespace ClaudeSwitch
                 El<CheckBox>("ReopenToggle").IsChecked = engine.Settings.ReopenDesktop;
                 El<CheckBox>("ManageCodeToggle").IsChecked = engine.Settings.ManageCode;
                 El<CheckBox>("AutoUpdateToggle").IsChecked = engine.Settings.AutoUpdate;
-                El<TextBlock>("UpdateStatusText").Text = "Version " + Updater.CurrentText + ". "
-                    + (updateStatus.Length > 0 ? updateStatus : "New versions come from this project's GitHub releases.");
+                ShowUpdateUi();
                 El<TextBlock>("DesktopPathText").Text = engine.Desktop.Found ? engine.Desktop.DataDir : "Not found. Click “Change…” to pick it.";
                 El<TextBlock>("CodePathText").Text = engine.Code.Found ? engine.Code.CredentialsPath : "Not found (Claude Code isn't installed here).";
                 El<Button>("DesktopAutoBtn").Visibility = string.IsNullOrEmpty(engine.Settings.DesktopDataDir) ? Visibility.Collapsed : Visibility.Visible;

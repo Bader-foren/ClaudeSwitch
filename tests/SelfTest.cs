@@ -144,15 +144,22 @@ namespace ClaudeSwitch.Tests
                 WriteFeed(feed, "v9.9.10", newExe, new string('0', 64));
                 bool refused = false;
                 try { Updater.Install(Updater.Check(), exe); }
-                catch (InvalidOperationException) { refused = true; }
+                catch (UserMessageException) { refused = true; }
                 Check(refused && AssemblyName.GetAssemblyName(exe).Version == new Version(9, 9, 9, 0) && !File.Exists(exe + ".download"),
                     "a download that doesn't match GitHub's checksum is refused and nothing changes");
 
                 WriteFeed(feed, "v9.9.10", newExe, Sha256(newExe));
                 refused = false;
                 try { Updater.Install(Updater.Check(), exe); }
-                catch (InvalidOperationException) { refused = true; }
+                catch (UserMessageException) { refused = true; }
                 Check(refused, "a file that isn't the promised version is refused");
+
+                WriteFeed(feed, "v9.9.11", Path.Combine(feedDir, "missing.exe"), Sha256(newExe));
+                refused = false;
+                try { Updater.Install(Updater.Check(), exe); }
+                catch (UserMessageException) { refused = true; }
+                Check(refused && AssemblyName.GetAssemblyName(exe).Version == new Version(9, 9, 9, 0) && !File.Exists(exe + ".download"),
+                    "a failed download is reported clearly and nothing changes");
 
                 WriteFeed(feed, "v1.0.0", newExe, Sha256(newExe));
                 Check(!Updater.IsNewer(Updater.Check()), "never goes back to an older version");

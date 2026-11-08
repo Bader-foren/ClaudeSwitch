@@ -17,7 +17,7 @@ namespace ClaudeSwitch
             AutoUpdate = true;
         }
 
-        /// <summary>Install new versions from GitHub automatically.</summary>
+        /// <summary>Check GitHub for new versions automatically. Installing one takes a click in Settings.</summary>
         public bool AutoUpdate { get; set; }
 
         /// <summary>"system", "light" or "dark".</summary>
